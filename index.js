@@ -62,42 +62,72 @@ async function postSOAP(soap){
 function parseSOAP(text){
   const parser = new XMLParser({ ignoreAttributes: false });
   const xml = parser.parse(text);
-  const envKey  = Object.keys(xml).find(k => /:envelope$/i.test(k) || k === "Envelope") || "Envelope";
-  const env     = xml[envKey] || xml.Envelope || xml;
-  const bodyKey = Object.keys(env).find(k => /:body$/i.test(k) || k === "Body") || "Body";
-  const body    = env[bodyKey];
 
+  // helpers robustes aux namespaces
+  const pick = (obj, tag) => {
+    const t = (tag || "").toLowerCase();
+    const k = Object.keys(obj || {}).find(k => {
+      const kl = k.toLowerCase();
+      const tail = kl.includes(":") ? kl.split(":").pop() : kl;
+      return kl === t || tail === t;
+    });
+    return k ? obj[k] : undefined;
+  };
+  const findChild = (obj, tag) => {
+    const t = (tag || "").toLowerCase();
+    const k = Object.keys(obj || {}).find(k => {
+      const kl = k.toLowerCase();
+      const tail = kl.includes(":") ? kl.split(":").pop() : kl;
+      return tail === t;
+    });
+    return k ? obj[k] : undefined;
+  };
+
+  // Envelope / Body
+  const env = findChild(xml, "envelope") || xml.Envelope || xml;
+  const body = findChild(env, "body");
   if (!body) throw new Error("ParseError: Body not found");
 
-  const faultKey = Object.keys(body).find(k => /:fault$/i.test(k) || k === "Fault");
-  if (faultKey) {
-    const fs = body[faultKey]?.faultstring || body[faultKey]?.faultcode || "SOAP Fault";
+  // Fault ?
+  const fault = findChild(body, "fault");
+  if (fault) {
+    const fs = pick(fault, "faultstring") || pick(fault, "faultcode") || "SOAP Fault";
     const err = new Error(`VIES Fault: ${fs}`);
     err._fault = String(fs || "").toUpperCase();
     throw err;
   }
 
-  const okKey1 = Object.keys(body).find(k => /:checkvatresponse$/i.test(k) || k === "checkVatResponse");
-  const okKey2 = Object.keys(body).find(k => /:checkvatapproxresponse$/i.test(k) || k === "checkVatApproxResponse");
-  const ok = body[okKey1] || body[okKey2];
+  // Response (standard ou approx)
+  const ok = findChild(body, "checkVatResponse") || findChild(body, "checkVatApproxResponse");
   if (!ok) throw new Error("ParseError: *Response not found");
 
-  // champs communs
-  const valid   = String(ok.valid).toLowerCase() === "true";
-  const cc      = ok.countryCode;
-  const number  = ok.vatNumber;
-  const date    = ok.requestDate || null;
-  const name    = (ok.name || ok.traderName || "").trim();
-  const address = (ok.address || ok.traderAddress || "").replace(/\n+/g,"\n").trim();
+  // Champs robustes aux prefixes
+  let validVal = pick(ok, "valid");
+  let valid;
+  if (typeof validVal === "boolean") valid = validVal;
+  else if (validVal != null) valid = String(validVal).trim().toLowerCase() === "true";
+  else {
+    // fallback regex direct sur le XML brut
+    const m = text.match(/<[\w:]*valid>\s*(true|false)\s*<\/[\w:]*valid>/i);
+    if (!m) throw new Error("ParseError: valid not found");
+    valid = m[1].toLowerCase() === "true";
+  }
 
-  // champs approx (si présent)
+  const countryCode = pick(ok, "countryCode") || null;
+  const vatNumber   = pick(ok, "vatNumber")   || null;
+  const requestDate = pick(ok, "requestDate") || null;
+  const name        = (pick(ok, "name") || pick(ok, "traderName") || "").trim();
+  const address     = ((pick(ok, "address") || pick(ok, "traderAddress") || "") + "")
+                        .replace(/\r?\n+/g, "\n").trim();
+
   const traderMatch = {
-    name: ok.traderNameMatch || null,
-    address: ok.traderAddressMatch || null
+    name: pick(ok, "traderNameMatch") || null,
+    address: pick(ok, "traderAddressMatch") || null
   };
 
-  return { valid, countryCode: cc, vatNumber: number, requestDate: date, name, address, traderMatch };
+  return { valid, countryCode, vatNumber, requestDate, name, address, traderMatch };
 }
+
 
 // ---------- VIES calls ----------
 async function checkVat(countryCode, vatNumber){
