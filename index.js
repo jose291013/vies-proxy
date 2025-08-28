@@ -8,6 +8,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(s=>s.trim()).filter(Boolean);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 12000);
 const NODE_ENV = process.env.NODE_ENV || "production";
+const REQUESTER_VAT = process.env.REQUESTER_VAT || "";
+
 
 // ---------- app & CORS ----------
 const app = express();
@@ -157,7 +159,8 @@ app.get("/api/vies-check", async (req,res)=>{
 
     // 2) Option: checkVatApprox si on a un requesterVat
     let step2;
-    const rq = requesterVat ? parseVat(requesterVat) : null;
+    const rq = requesterVat ? parseVat(requesterVat)
+         : (REQUESTER_VAT ? parseVat(REQUESTER_VAT) : null);
     if (rq) {
       try {
         step2 = await checkVatApprox(
