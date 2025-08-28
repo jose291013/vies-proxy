@@ -4,12 +4,13 @@ import { XMLParser } from "fast-xml-parser";
 import { fetch } from "undici";
 
 const PORT = process.env.PORT || 3000;
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").map(s=>s.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",").map(s=>s.trim()).filter(Boolean);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 12000);
+const NODE_ENV = process.env.NODE_ENV || "production";
 
+// ---------- app & CORS ----------
 const app = express();
-
-// CORS strict
 app.use((req,res,next)=>{
   const origin = req.headers.origin || "";
   if (ALLOWED_ORIGINS.length && ALLOWED_ORIGINS.includes(origin)) {
@@ -22,126 +23,164 @@ app.use((req,res,next)=>{
   next();
 });
 
+// ---------- utils ----------
 function parseVat(raw){
   const cleaned = (raw||"").toUpperCase().replace(/[\s.-]/g,"").replace(/^EU/,"");
-  const countryCode = cleaned.slice(0,2);
-  const vatNumber = cleaned.slice(2);
-  if (!/^[A-Z]{2}$/.test(countryCode) || !/^[0-9A-Z+*.]{2,}$/.test(vatNumber)) return null;
-  return { countryCode, vatNumber };
+  const cc = cleaned.slice(0,2);
+  const num = cleaned.slice(2);
+  if (!/^[A-Z]{2}$/.test(cc) || !/^[0-9A-Z+*.]{2,}$/.test(num)) return null;
+  return { countryCode: cc, vatNumber: num };
 }
 
-async function checkVatVIES(countryCode, vatNumber){
-  const url = "https://ec.europa.eu/taxation_customs/vies/services/checkVatService";
-  const soap = `
+function buildEnvelope(body){
+  return `
   <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
                     xmlns:urn="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
     <soapenv:Header/>
-    <soapenv:Body>
-      <urn:checkVat>
-        <urn:countryCode>${countryCode}</urn:countryCode>
-        <urn:vatNumber>${vatNumber}</urn:vatNumber>
-      </urn:checkVat>
-    </soapenv:Body>
+    <soapenv:Body>${body}</soapenv:Body>
   </soapenv:Envelope>`.trim();
+}
 
+async function postSOAP(soap){
+  const url = "https://ec.europa.eu/taxation_customs/vies/services/checkVatService";
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "text/xml; charset=utf-8",
       "SOAPAction": '""',
-      "User-Agent": "VIES-Proxy/1.1"
+      "User-Agent": "VIES-Proxy/1.2"
     },
     body: soap,
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
   });
-
   const text = await res.text();
-
-  // 1) tentative parse XML “largement” tolérante
-  try {
-    const parser = new XMLParser({ ignoreAttributes: false });
-    const xml = parser.parse(text);
-
-    const envKey  = Object.keys(xml).find(k => /:envelope$/i.test(k) || k === "Envelope") || "Envelope";
-    const env     = xml[envKey] || xml.Envelope || xml;
-    const bodyKey = Object.keys(env).find(k => /:body$/i.test(k) || k === "Body") || "Body";
-    const body    = env[bodyKey];
-
-    if (!body) throw new Error("ParseError: Body not found");
-
-    const faultKey = Object.keys(body).find(k => /:fault$/i.test(k) || k === "Fault");
-    if (faultKey) {
-      const fs = body[faultKey]?.faultstring || body[faultKey]?.faultcode || "SOAP Fault";
-      const msg = String(fs || "").toUpperCase();
-      const err = new Error(`VIES Fault: ${fs}`);
-      err._fault = msg;
-      throw err;
-    }
-
-    const okKey = Object.keys(body).find(k => /:checkvatresponse$/i.test(k) || k === "checkVatResponse");
-    const ok = body[okKey];
-    if (!ok) throw new Error("ParseError: checkVatResponse not found");
-
-    const valid = String(ok.valid).toLowerCase() === "true";
-    const name = (ok.name || "").trim();
-    const address = (ok.address || "").replace(/\n+/g, "\n").trim();
-
-    return {
-      valid,
-      countryCode: ok.countryCode || countryCode,
-      vatNumber: ok.vatNumber || vatNumber,
-      requestDate: ok.requestDate || null,
-      name,
-      address
-    };
-  } catch (e) {
-    // 2) fallback regex (au cas où les namespaces bougent)
-    const mValid   = text.match(/<[\w:]*valid>(true|false)<\/[\w:]*valid>/i);
-    const mCC      = text.match(/<[\w:]*countryCode>([^<]+)<\/[\w:]*countryCode>/i);
-    const mVAT     = text.match(/<[\w:]*vatNumber>([^<]+)<\/[\w:]*vatNumber>/i);
-    const mName    = text.match(/<[\w:]*name>([^<]*)<\/[\w:]*name>/i);
-    const mAddress = text.match(/<[\w:]*address>([\s\S]*?)<\/[\w:]*address>/i);
-    const mFault   = text.match(/<[\w:]*faultstring>([^<]+)<\/[\w:]*faultstring>/i);
-
-    if (mFault) {
-      const err = new Error(`VIES Fault: ${mFault[1]}`);
-      err._fault = String(mFault[1]).toUpperCase();
-      throw err;
-    }
-    if (!mValid) throw new Error("ParseError: neither structured nor regex parse worked");
-
-    return {
-      valid: mValid[1].toLowerCase() === "true",
-      countryCode: (mCC?.[1] || countryCode),
-      vatNumber: (mVAT?.[1] || vatNumber),
-      requestDate: null,
-      name: (mName?.[1] || "").trim(),
-      address: (mAddress?.[1] || "").replace(/\n+/g,"\n").trim()
-    };
-  }
+  return { status: res.status, text };
 }
 
-app.get("/health", (req,res)=>res.json({ ok:true }));
+function parseSOAP(text){
+  const parser = new XMLParser({ ignoreAttributes: false });
+  const xml = parser.parse(text);
+  const envKey  = Object.keys(xml).find(k => /:envelope$/i.test(k) || k === "Envelope") || "Envelope";
+  const env     = xml[envKey] || xml.Envelope || xml;
+  const bodyKey = Object.keys(env).find(k => /:body$/i.test(k) || k === "Body") || "Body";
+  const body    = env[bodyKey];
 
+  if (!body) throw new Error("ParseError: Body not found");
+
+  const faultKey = Object.keys(body).find(k => /:fault$/i.test(k) || k === "Fault");
+  if (faultKey) {
+    const fs = body[faultKey]?.faultstring || body[faultKey]?.faultcode || "SOAP Fault";
+    const err = new Error(`VIES Fault: ${fs}`);
+    err._fault = String(fs || "").toUpperCase();
+    throw err;
+  }
+
+  const okKey1 = Object.keys(body).find(k => /:checkvatresponse$/i.test(k) || k === "checkVatResponse");
+  const okKey2 = Object.keys(body).find(k => /:checkvatapproxresponse$/i.test(k) || k === "checkVatApproxResponse");
+  const ok = body[okKey1] || body[okKey2];
+  if (!ok) throw new Error("ParseError: *Response not found");
+
+  // champs communs
+  const valid   = String(ok.valid).toLowerCase() === "true";
+  const cc      = ok.countryCode;
+  const number  = ok.vatNumber;
+  const date    = ok.requestDate || null;
+  const name    = (ok.name || ok.traderName || "").trim();
+  const address = (ok.address || ok.traderAddress || "").replace(/\n+/g,"\n").trim();
+
+  // champs approx (si présent)
+  const traderMatch = {
+    name: ok.traderNameMatch || null,
+    address: ok.traderAddressMatch || null
+  };
+
+  return { valid, countryCode: cc, vatNumber: number, requestDate: date, name, address, traderMatch };
+}
+
+// ---------- VIES calls ----------
+async function checkVat(countryCode, vatNumber){
+  const soap = buildEnvelope(`
+    <urn:checkVat>
+      <urn:countryCode>${countryCode}</urn:countryCode>
+      <urn:vatNumber>${vatNumber}</urn:vatNumber>
+    </urn:checkVat>`);
+  const { text } = await postSOAP(soap);
+  return { parsed: parseSOAP(text), raw: text };
+}
+
+async function checkVatApprox(countryCode, vatNumber, requesterCountryCode, requesterVatNumber, trader={}){
+  const soap = buildEnvelope(`
+    <urn:checkVatApprox>
+      <urn:countryCode>${countryCode}</urn:countryCode>
+      <urn:vatNumber>${vatNumber}</urn:vatNumber>
+      <urn:traderName>${trader.name || ""}</urn:traderName>
+      <urn:traderStreet>${trader.street || ""}</urn:traderStreet>
+      <urn:traderPostcode>${trader.postcode || ""}</urn:traderPostcode>
+      <urn:traderCity>${trader.city || ""}</urn:traderCity>
+      <urn:requesterCountryCode>${requesterCountryCode}</urn:requesterCountryCode>
+      <urn:requesterVatNumber>${requesterVatNumber}</urn:requesterVatNumber>
+    </urn:checkVatApprox>`);
+  const { text } = await postSOAP(soap);
+  return { parsed: parseSOAP(text), raw: text };
+}
+
+// ---------- routes ----------
+app.get("/health", (req,res)=> res.json({ ok:true }));
+
+// GET /api/vies-check?vat=FR40303265045[&requesterVat=FRxx][&debug=1]
 app.get("/api/vies-check", async (req,res)=>{
-  try{
-    const { vat } = req.query;
-    const parsed = parseVat(vat);
-    if (!parsed) return res.status(400).json({ ok:false, error:"VAT invalide (format)" });
+  const { vat, requesterVat, debug } = req.query;
 
-    const r = await checkVatVIES(parsed.countryCode, parsed.vatNumber);
-    return res.json({ ok:true, ...r });
-  } catch (e){
-    const msg = (e?.message || "").toUpperCase();
-    console.error("[VIES ERROR]", e?.message);
+  try {
+    const target = parseVat(vat);
+    if (!target) return res.status(400).json({ ok:false, error:"VAT invalide (format)" });
 
-    if (msg.includes("INVALID_INPUT"))  return res.status(400).json({ ok:false, error:"VIES: INVALID_INPUT (format non conforme)" });
-    if (msg.includes("MS_UNAVAILABLE") || msg.includes("SERVICE_UNAVAILABLE")) return res.status(503).json({ ok:false, error:"VIES indisponible (réessayer)" });
-    if (msg.includes("GLOBAL_MAX_CONCURRENT_REQ") || msg.includes("BUSY"))      return res.status(429).json({ ok:false, error:"VIES rate limit (trop de requêtes)" });
-    if (msg.includes("PARSEERROR"))     return res.status(502).json({ ok:false, error:"Erreur de parsing SOAP" });
+    // 1) checkVat standard
+    let step1;
+    try {
+      step1 = await checkVat(target.countryCode, target.vatNumber);
+    } catch (e) {
+      const msg = (e?.message || "").toUpperCase();
+      if (msg.includes("INVALID_INPUT"))  return res.status(400).json({ ok:false, error:"VIES: INVALID_INPUT (format non conforme)" });
+      if (msg.includes("SERVICE_UNAVAILABLE") || msg.includes("MS_UNAVAILABLE")) return res.status(503).json({ ok:false, error:"VIES indisponible (réessayer)" });
+      if (msg.includes("GLOBAL_MAX_CONCURRENT_REQ") || msg.includes("BUSY"))      return res.status(429).json({ ok:false, error:"VIES rate limit (trop de requêtes)" });
+      if (msg.includes("PARSEERROR"))     return res.status(502).json({ ok:false, error:"Erreur de parsing SOAP" });
+      throw e;
+    }
 
+    // Si déjà validé → retourne tout de suite
+    if (step1.parsed.valid) {
+      const out = { ok:true, ...step1.parsed };
+      if (debug === "1" && NODE_ENV !== "production") out._raw = step1.raw.slice(0, 2000);
+      return res.json(out);
+    }
+
+    // 2) Option: checkVatApprox si on a un requesterVat
+    let step2;
+    const rq = requesterVat ? parseVat(requesterVat) : null;
+    if (rq) {
+      try {
+        step2 = await checkVatApprox(
+          target.countryCode, target.vatNumber,
+          rq.countryCode, rq.vatNumber,
+          {} // trader infos vides
+        );
+      } catch (e) {
+        // si approx casse, on ignore et on renvoie le step1
+        step2 = null;
+      }
+    }
+
+    const best = step2?.parsed?.valid ? step2 : step1;
+    const out = { ok:true, ...best.parsed };
+    if (debug === "1" && NODE_ENV !== "production") out._raw = best.raw.slice(0, 2000);
+    return res.json(out);
+
+  } catch (e) {
+    console.error("[/api/vies-check]", e?.message);
     return res.status(502).json({ ok:false, error: e?.message || "Erreur VIES" });
   }
 });
 
-app.listen(PORT, ()=> console.log(`[vies-proxy] :${PORT}`));
+app.listen(PORT, ()=> console.log(`[vies-proxy] listening on :${PORT}`));
+
