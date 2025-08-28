@@ -175,8 +175,8 @@ app.get("/api/vies-check", async (req,res)=>{
     }
 
     const best = step2?.parsed?.valid ? step2 : step1;
-    const out = { ok:true, ...best.parsed };
-    if (debug === "1" && NODE_ENV !== "production") out._raw = best.raw.slice(0, 2000);
+    const out = { ok:true, ...best.parsed, source: step2?.parsed?.valid ? "approx" : "standard" };
+    if (debug === "1") out._raw = best.raw.slice(0, 2000);
     return res.json(out);
 
   } catch (e) {
